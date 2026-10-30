@@ -1,10 +1,10 @@
-
 import streamlit as st
 import tensorflow as tf
 import numpy as np
 import cv2
 
 from PIL import Image
+from streamlit_drawable_canvas import st_canvas
 
 
 # ==================================================
@@ -426,3 +426,185 @@ if uploaded_file is not None:
             "The model score is not necessarily a calibrated "
             "probability. Incorrect predictions are possible."
         )
+        # ==================================================
+# 20. DRAW DIGIT ON SCREEN
+# ==================================================
+
+st.divider()
+
+st.header("✍️ Draw a Digit")
+
+st.write(
+    "Use your mouse to draw a digit from 0 to 9 "
+    "in the white box below."
+)
+
+# Create a key for resetting the canvas
+if "canvas_reset_counter" not in st.session_state:
+    st.session_state.canvas_reset_counter = 0
+
+# Clear button
+if st.button("🧹 Clear Drawing"):
+    st.session_state.canvas_reset_counter += 1
+    st.rerun()
+
+# Drawing canvas
+canvas_result = st_canvas(
+    stroke_width=15,
+    stroke_color="#000000",
+    background_color="#FFFFFF",
+    drawing_mode="freedraw",
+    height=280,
+    width=280,
+    update_streamlit=True,
+    key=f"digit_canvas_{st.session_state.canvas_reset_counter}",
+    return_image_data=True
+)
+
+# Predict button
+if st.button("🔍 Predict Drawn Digit"):
+
+    if canvas_result.image_data is None:
+        st.warning("Please draw a digit first.")
+
+    else:
+
+        # Convert canvas image to an 8-bit array
+        rgba = np.asarray(
+            canvas_result.image_data
+        ).astype(np.uint8)
+
+        # Convert RGBA to grayscale
+        gray = cv2.cvtColor(
+            rgba,
+            cv2.COLOR_RGBA2GRAY
+        )
+
+        # Convert the black digit to white foreground
+        # and the white background to black
+        _, binary = cv2.threshold(
+            gray,
+            200,
+            255,
+            cv2.THRESH_BINARY_INV
+        )
+
+        # Find the digit boundaries
+        points = cv2.findNonZero(binary)
+
+        if points is None:
+            st.warning("Please draw a digit first.")
+
+        else:
+
+            x, y, w, h = cv2.boundingRect(points)
+
+            digit = binary[y:y + h, x:x + w]
+
+            # Add padding around the digit
+            padding = max(
+                2,
+                int(max(w, h) * 0.10)
+            )
+
+            digit = cv2.copyMakeBorder(
+                digit,
+                padding,
+                padding,
+                padding,
+                padding,
+                cv2.BORDER_CONSTANT,
+                value=0
+            )
+
+            # Resize while preserving the aspect ratio
+            digit_h, digit_w = digit.shape
+
+            scale = 20.0 / max(
+                digit_h,
+                digit_w
+            )
+
+            new_w = max(
+                1,
+                int(round(digit_w * scale))
+            )
+
+            new_h = max(
+                1,
+                int(round(digit_h * scale))
+            )
+
+            resized = cv2.resize(
+                digit,
+                (new_w, new_h),
+                interpolation=cv2.INTER_AREA
+            )
+
+            # Center the digit in a 28 x 28 image
+            processed = np.zeros(
+                (28, 28),
+                dtype=np.uint8
+            )
+
+            offset_x = (28 - new_w) // 2
+            offset_y = (28 - new_h) // 2
+
+            processed[
+                offset_y:offset_y + new_h,
+                offset_x:offset_x + new_w
+            ] = resized
+
+            # Normalize and prepare CNN input
+            img_array = processed.astype(
+                np.float32
+            ) / 255.0
+
+            img_array = img_array.reshape(
+                1, 28, 28, 1
+            )
+
+            # Predict the digit
+            predictions = model.predict(
+                img_array,
+                verbose=0
+            )[0]
+
+            predicted_digit = int(
+                np.argmax(predictions)
+            )
+
+            model_score = float(
+                predictions[predicted_digit]
+            ) * 100
+
+            # Display processed image
+            st.subheader("Processed Drawing")
+
+            st.image(
+                processed,
+                caption="28 x 28 CNN Input",
+                width=200
+            )
+
+            # Display result
+            st.subheader("Prediction Result")
+
+            st.success(
+                f"Predicted Digit: {predicted_digit}"
+            )
+
+            st.metric(
+                "Model Score",
+                f"{model_score:.2f}%"
+            )
+
+            # Display scores for all digits
+            st.subheader("Scores for Digits 0–9")
+
+            score_data = {
+                str(i): float(predictions[i])
+                for i in range(10)
+            }
+
+            st.bar_chart(score_data)
