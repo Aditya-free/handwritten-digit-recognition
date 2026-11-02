@@ -37,7 +37,25 @@ except Exception as e:
 
 
 # ==================================================
-# 3. APPLICATION INTERFACE
+# 3. DESKEW HELPER
+# ==================================================
+
+def deskew(img):
+    m = cv2.moments(img)
+    if abs(m['mu02']) < 1e-2:
+        return img
+    skew = m['mu11'] / m['mu02']
+    rows, cols = img.shape
+    M = np.float32([[1, skew, -0.5 * cols * skew], [0, 1, 0]])
+    deskewed = cv2.warpAffine(
+        img, M, (cols, rows),
+        flags=cv2.WARP_INVERSE_MAP | cv2.INTER_LINEAR
+    )
+    return deskewed
+
+
+# ==================================================
+# 4. APPLICATION INTERFACE
 # ==================================================
 
 st.title("🔢 Handwritten Digit Recognition")
@@ -50,13 +68,14 @@ st.write(
 )
 
 st.info(
-    "For better results, upload a clear image with "
-    "one dark handwritten digit on light paper."
+    "For best results with notebook photos: ensure good lighting, "
+    "hold the camera steady, and crop tightly around the digit. "
+    "The app handles lined paper and uneven lighting automatically."
 )
 
 
 # ==================================================
-# 4. UPLOAD IMAGE
+# 5. UPLOAD IMAGE
 # ==================================================
 
 uploaded_file = st.file_uploader(
@@ -89,7 +108,7 @@ if uploaded_file is not None:
     )
 
     # ==================================================
-    # 5. IMAGE CROPPING CONTROLS
+    # 6. IMAGE CROPPING CONTROLS
     # ==================================================
 
     st.subheader("Adjust Image Crop")
@@ -127,7 +146,7 @@ if uploaded_file is not None:
     if st.button("Recognize Digit"):
 
         # ==================================================
-        # 6. CROP IMAGE
+        # 7. CROP IMAGE
         # ==================================================
 
         rgb = np.array(original_image)
@@ -147,7 +166,7 @@ if uploaded_file is not None:
             st.stop()
 
         # ==================================================
-        # 7. CONVERT TO GRAYSCALE
+        # 8. CONVERT TO GRAYSCALE
         # ==================================================
 
         gray = cv2.cvtColor(
@@ -155,22 +174,45 @@ if uploaded_file is not None:
             cv2.COLOR_RGB2GRAY
         )
 
-        # Improve local contrast
+        # ==================================================
+        # 9. AUTO BRIGHTNESS / GAMMA CORRECTION
+        # ==================================================
+
+        mean_brightness = float(np.mean(gray))
+
+        if mean_brightness < 80:
+            gamma = 0.5  # brighten dark images
+        elif mean_brightness > 180:
+            gamma = 1.5  # darken washed-out images
+        else:
+            gamma = 1.0  # no correction needed
+
+        if gamma != 1.0:
+            gamma_corrected = (
+                np.power(gray / 255.0, gamma) * 255.0
+            ).astype(np.uint8)
+        else:
+            gamma_corrected = gray.copy()
+
+        # ==================================================
+        # 10. IMPROVE LOCAL CONTRAST (CLAHE)
+        # ==================================================
+
         clahe = cv2.createCLAHE(
-            clipLimit=2.0,
+            clipLimit=3.0,
             tileGridSize=(8, 8)
         )
 
-        enhanced = clahe.apply(gray)
+        enhanced = clahe.apply(gamma_corrected)
 
         # ==================================================
-        # 8. THRESHOLD THE IMAGE
+        # 11. THRESHOLD THE IMAGE (ADAPTIVE + OTSU FALLBACK)
         # ==================================================
 
         # Dark handwriting becomes white foreground.
         # Light background becomes black.
 
-        binary = cv2.adaptiveThreshold(
+        binary_adaptive = cv2.adaptiveThreshold(
             enhanced,
             255,
             cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -179,43 +221,62 @@ if uploaded_file is not None:
             10
         )
 
-        # ==================================================
-        # 9. REMOVE LONG HORIZONTAL NOTEBOOK LINES
-        # ==================================================
+        total_pixels = binary_adaptive.shape[0] * binary_adaptive.shape[1]
+        nonzero_adaptive = int(np.count_nonzero(binary_adaptive))
 
-        kernel_width = max(
-            40,
-            int(binary.shape[1] * 0.45)
-        )
-
-        horizontal_kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (kernel_width, 1)
-        )
-
-        horizontal_lines = cv2.morphologyEx(
-            binary,
-            cv2.MORPH_OPEN,
-            horizontal_kernel
-        )
-
-        # Expand the detected lines slightly
-        line_mask = cv2.dilate(
-            horizontal_lines,
-            cv2.getStructuringElement(
-                cv2.MORPH_RECT,
-                (3, 3)
+        if nonzero_adaptive < int(total_pixels * 0.01):
+            # Foreground too sparse — fall back to Otsu
+            _, binary_otsu = cv2.threshold(
+                enhanced,
+                0,
+                255,
+                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
             )
-        )
+            # Pick whichever gives more foreground pixels
+            if int(np.count_nonzero(binary_otsu)) > nonzero_adaptive:
+                binary = binary_otsu
+            else:
+                binary = binary_adaptive
+        else:
+            binary = binary_adaptive
 
-        # Remove detected horizontal lines
-        cleaned = cv2.subtract(
+        # ==================================================
+        # 12. MORPHOLOGICAL CLOSING (FILL STROKE GAPS)
+        # ==================================================
+
+        binary = cv2.morphologyEx(
             binary,
-            line_mask
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         )
 
         # ==================================================
-        # 10. REMOVE SMALL NOISE COMPONENTS
+        # 13. REMOVE LONG HORIZONTAL NOTEBOOK LINES
+        # ==================================================
+
+        count_cc, labels_cc, stats_cc, _ = cv2.connectedComponentsWithStats(
+            binary, connectivity=8
+        )
+
+        line_mask_cc = np.zeros_like(binary)
+
+        for i in range(1, count_cc):
+            comp_w = stats_cc[i, cv2.CC_STAT_WIDTH]
+            comp_h = stats_cc[i, cv2.CC_STAT_HEIGHT]
+            # Only erase wide, thin components (notebook ruled lines)
+            if comp_h > 0 and comp_w > 5 * comp_h:
+                line_mask_cc[labels_cc == i] = 255
+
+        # Expand the detected lines slightly then subtract
+        line_mask_dilated = cv2.dilate(
+            line_mask_cc,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        )
+
+        cleaned = cv2.subtract(binary, line_mask_dilated)
+
+        # ==================================================
+        # 14. REMOVE SMALL NOISE COMPONENTS
         # ==================================================
 
         count, labels, stats, _ = (
@@ -237,7 +298,17 @@ if uploaded_file is not None:
                 mask[labels == i] = 255
 
         # ==================================================
-        # 11. FIND THE DIGIT
+        # 15. LIGHT STROKE NORMALIZATION (SMOOTH JAGGED EDGES)
+        # ==================================================
+
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        )
+
+        # ==================================================
+        # 16. FIND THE DIGIT
         # ==================================================
 
         points = cv2.findNonZero(mask)
@@ -253,7 +324,16 @@ if uploaded_file is not None:
 
         digit = mask[y:y + h, x:x + w]
 
-        # Add padding around the digit
+        # ==================================================
+        # 17. DESKEW
+        # ==================================================
+
+        digit = deskew(digit)
+
+        # ==================================================
+        # 18. ADD PADDING AROUND THE DIGIT
+        # ==================================================
+
         padding = max(
             2,
             int(max(w, h) * 0.10)
@@ -270,7 +350,7 @@ if uploaded_file is not None:
         )
 
         # ==================================================
-        # 12. RESIZE TO FIT A 20 x 20 AREA
+        # 19. RESIZE TO FIT A 20 x 20 AREA
         # ==================================================
 
         digit_h, digit_w = padded.shape
@@ -297,7 +377,7 @@ if uploaded_file is not None:
         )
 
         # ==================================================
-        # 13. CENTER IN A 28 x 28 CANVAS
+        # 20. CENTER IN A 28 x 28 CANVAS
         # ==================================================
 
         canvas = np.zeros(
@@ -314,7 +394,26 @@ if uploaded_file is not None:
         ] = resized
 
         # ==================================================
-        # 14. PREPARE CNN INPUT
+        # 21. QUALITY FEEDBACK
+        # ==================================================
+
+        nonzero_canvas = int(np.count_nonzero(canvas))
+
+        if nonzero_canvas < 20:
+            st.warning(
+                "The processed image looks very sparse (fewer than 20 "
+                "white pixels). The crop may be off, or the digit is "
+                "very faint. Consider adjusting the crop sliders."
+            )
+        elif nonzero_canvas > 700:
+            st.warning(
+                "The processed image is very dense (more than 700 "
+                "white pixels). There may be significant background "
+                "noise. Consider adjusting the crop sliders."
+            )
+
+        # ==================================================
+        # 22. PREPARE CNN INPUT
         # ==================================================
 
         img_array = canvas.astype(
@@ -326,7 +425,7 @@ if uploaded_file is not None:
         )
 
         # ==================================================
-        # 15. MAKE PREDICTION
+        # 23. MAKE PREDICTION
         # ==================================================
 
         try:
@@ -348,7 +447,7 @@ if uploaded_file is not None:
         ) * 100
 
         # ==================================================
-        # 16. DISPLAY PROCESSED IMAGE
+        # 24. DISPLAY PROCESSED IMAGE
         # ==================================================
 
         st.subheader("Processed Image")
@@ -364,7 +463,7 @@ if uploaded_file is not None:
         )
 
         # ==================================================
-        # 17. DISPLAY PREDICTION
+        # 25. DISPLAY PREDICTION
         # ==================================================
 
         st.subheader("Prediction Result")
@@ -379,7 +478,7 @@ if uploaded_file is not None:
         )
 
         # ==================================================
-        # 18. DISPLAY ALL MODEL SCORES
+        # 26. DISPLAY ALL MODEL SCORES
         # ==================================================
 
         st.subheader("Scores for Digits 0–9")
@@ -392,7 +491,7 @@ if uploaded_file is not None:
         st.bar_chart(score_data)
 
         # ==================================================
-        # 19. SHOW IMAGE PROCESSING STEPS
+        # 27. SHOW IMAGE PROCESSING STEPS (DEBUG)
         # ==================================================
 
         with st.expander("Debug Image Processing"):
@@ -403,31 +502,42 @@ if uploaded_file is not None:
             )
 
             st.image(
+                gamma_corrected,
+                caption="2. Gamma Corrected"
+            )
+
+            st.image(
                 enhanced,
-                caption="2. Enhanced Grayscale Image"
+                caption="3. Enhanced Grayscale (CLAHE)"
             )
 
             st.image(
                 binary,
-                caption="3. Thresholded Image"
+                caption="4. Thresholded (after closing)"
             )
 
             st.image(
                 cleaned,
-                caption="4. Image After Line Removal"
+                caption="5. After Line Removal"
             )
 
             st.image(
                 mask,
-                caption="5. Image After Noise Removal"
+                caption="6. After Noise Removal"
+            )
+
+            st.image(
+                digit,
+                caption="7. Deskewed Digit (before 28×28 resize)"
             )
 
         st.caption(
             "The model score is not necessarily a calibrated "
             "probability. Incorrect predictions are possible."
         )
-        # ==================================================
-# 20. DRAW DIGIT ON SCREEN
+
+# ==================================================
+# 28. DRAW DIGIT ON SCREEN
 # ==================================================
 
 st.divider()
