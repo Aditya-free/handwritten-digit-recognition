@@ -3,7 +3,7 @@ import tensorflow as tf
 import numpy as np
 import cv2
 
-from PIL import Image
+from PIL import Image, ImageOps
 from streamlit_drawable_canvas import st_canvas
 
 
@@ -24,9 +24,7 @@ st.set_page_config(
 
 @st.cache_resource
 def load_model():
-    return tf.keras.models.load_model(
-        "handwritten_digit_cnn.keras"
-    )
+    return tf.keras.models.load_model("handwritten_digit_cnn.keras")
 
 
 try:
@@ -37,21 +35,209 @@ except Exception as e:
 
 
 # ==================================================
-# 3. DESKEW HELPER
+# 3. IMAGE PROCESSING HELPERS
 # ==================================================
 
-def deskew(img):
-    m = cv2.moments(img)
-    if abs(m['mu02']) < 1e-2:
-        return img
-    skew = m['mu11'] / m['mu02']
-    rows, cols = img.shape
-    M = np.float32([[1, skew, -0.5 * cols * skew], [0, 1, 0]])
-    deskewed = cv2.warpAffine(
-        img, M, (cols, rows),
-        flags=cv2.WARP_INVERSE_MAP | cv2.INTER_LINEAR
+WORK_SIZE = 400  # photo crop is resized so its longest side is this many px
+
+
+def photo_to_binary(rgb):
+    """
+    Notebook photo (RGB crop) -> binary image (white ink, black background).
+    Returns (binary, debug_images).
+    """
+    debug = {}
+
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    # --- 1. Resize to a fixed working size so kernel sizes are predictable
+    h, w = gray.shape
+    scale = WORK_SIZE / max(h, w)
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+    gray = cv2.resize(
+        gray,
+        (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+        interpolation=interp
     )
-    return deskewed
+
+    # --- 2. Remove uneven lighting / paper shading
+    #        (estimate the background, then divide it out)
+    bg = cv2.dilate(
+        gray,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    )
+    bg = cv2.medianBlur(bg, 31)
+    bg = np.maximum(bg, 1)
+    norm = cv2.divide(gray, bg, scale=255)
+    norm = cv2.GaussianBlur(norm, (3, 3), 0)
+    debug["1. Background-normalised gray"] = norm
+
+    # --- 3. Otsu threshold: dark ink -> white
+    _, binary = cv2.threshold(
+        norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+    )
+    debug["2. Thresholded"] = binary.copy()
+
+    # --- 4. Remove thin horizontal notebook lines (even if they touch the digit)
+    line_len = max(15, binary.shape[1] // 3)
+    lines = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (line_len, 1))
+    )
+    # keep thick parts (e.g. the bar of a 7 or 5), remove only thin parts
+    thick = cv2.morphologyEx(
+        lines,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7))
+    )
+    thin_lines = cv2.subtract(lines, thick)
+    thin_lines = cv2.dilate(
+        thin_lines,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
+    )
+    binary = cv2.subtract(binary, thin_lines)
+
+    # --- 5. Close small gaps left in the strokes
+    binary = cv2.morphologyEx(
+        binary,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    )
+    debug["3. After line removal + closing"] = binary.copy()
+
+    # --- 6. Keep only the main digit (drop stray noise)
+    binary = keep_main_digit(binary)
+    debug["4. Main digit only"] = binary.copy()
+
+    return binary, debug
+
+
+def keep_main_digit(binary):
+    """Keep the largest component plus big pieces close to it."""
+    n, labels, stats, cents = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+
+    if n <= 1:
+        return binary
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest = 1 + int(np.argmax(areas))
+    lx, ly, lw, lh = stats[largest, :4]
+    max_area = areas.max()
+
+    keep = np.zeros_like(binary)
+
+    for i in range(1, n):
+        if i == largest:
+            keep[labels == i] = 255
+            continue
+
+        area = stats[i, cv2.CC_STAT_AREA]
+        cx, cy = cents[i]
+
+        near = (
+            lx - 0.5 * lw <= cx <= lx + 1.5 * lw
+            and ly - 0.5 * lh <= cy <= ly + 1.5 * lh
+        )
+
+        # broken strokes (like in 4, 5, 7) are kept; tiny specks are dropped
+        if near and area >= 0.10 * max_area:
+            keep[labels == i] = 255
+
+    return keep
+
+
+def thicken_strokes(digit, size, target_ratio=0.08):
+    """
+    Pen strokes are thin compared to MNIST / canvas strokes.
+    Estimate the stroke width and dilate until it is ~8% of digit size.
+    """
+    dist = cv2.distanceTransform(digit, cv2.DIST_L2, 3)
+    vals = dist[digit > 0]
+
+    if vals.size == 0:
+        return digit
+
+    stroke = 4.0 * float(np.mean(vals))  # approx. stroke width in px
+    target = target_ratio * size
+
+    if stroke >= target:
+        return digit
+
+    add = int(round((target - stroke) / 2))
+    add = min(add, max(1, int(size * 0.06)))
+
+    if add < 1:
+        return digit
+
+    return cv2.dilate(
+        digit,
+        cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * add + 1, 2 * add + 1)
+        )
+    )
+
+
+def to_28x28(binary, thicken=False):
+    """
+    White-on-black binary image -> 28x28 MNIST-style image.
+    Used by BOTH the photo path and the canvas path.
+    """
+    points = cv2.findNonZero(binary)
+
+    if points is None:
+        return None
+
+    x, y, w, h = cv2.boundingRect(points)
+    digit = binary[y:y + h, x:x + w]
+
+    size = max(w, h)
+    padding = max(2, int(size * 0.10))
+
+    digit = cv2.copyMakeBorder(
+        digit, padding, padding, padding, padding,
+        cv2.BORDER_CONSTANT, value=0
+    )
+
+    if thicken:
+        digit = thicken_strokes(digit, size)
+
+    digit_h, digit_w = digit.shape
+    scale = 20.0 / max(digit_h, digit_w)
+
+    new_w = max(1, int(round(digit_w * scale)))
+    new_h = max(1, int(round(digit_h * scale)))
+
+    resized = cv2.resize(
+        digit, (new_w, new_h), interpolation=cv2.INTER_AREA
+    )
+
+    out = np.zeros((28, 28), dtype=np.uint8)
+    off_x = (28 - new_w) // 2
+    off_y = (28 - new_h) // 2
+    out[off_y:off_y + new_h, off_x:off_x + new_w] = resized
+
+    return out
+
+
+def predict_digit(img28):
+    arr = img28.astype(np.float32) / 255.0
+    arr = arr.reshape(1, 28, 28, 1)
+    return model.predict(arr, verbose=0)[0]
+
+
+def show_prediction(predictions):
+    predicted_digit = int(np.argmax(predictions))
+    score = float(predictions[predicted_digit]) * 100
+
+    st.subheader("Prediction Result")
+    st.success(f"Predicted Digit: {predicted_digit}")
+    st.metric("Model Score", f"{score:.2f}%")
+
+    st.subheader("Scores for Digits 0–9")
+    st.bar_chart({str(i): float(predictions[i]) for i in range(10)})
 
 
 # ==================================================
@@ -59,7 +245,6 @@ def deskew(img):
 # ==================================================
 
 st.title("🔢 Handwritten Digit Recognition")
-
 st.subheader("Deep Learning Project Using CNN")
 
 st.write(
@@ -69,8 +254,8 @@ st.write(
 
 st.info(
     "For best results with notebook photos: ensure good lighting, "
-    "hold the camera steady, and crop tightly around the digit. "
-    "The app handles lined paper and uneven lighting automatically."
+    "hold the camera steady, write with a dark pen, and crop tightly "
+    "around the digit."
 )
 
 
@@ -83,465 +268,109 @@ uploaded_file = st.file_uploader(
     type=["png", "jpg", "jpeg"]
 )
 
-
 if uploaded_file is not None:
 
-    try:
-        original_image = Image.open(
-            uploaded_file
-        ).convert("RGB")
+    original_image = None
 
+    try:
+        original_image = ImageOps.exif_transpose(
+            Image.open(uploaded_file)
+        ).convert("RGB")
     except Exception:
         st.error("Unable to open this image.")
-        st.stop()
 
-    st.image(
-        original_image,
-        caption="Original Uploaded Image",
-        width=350
-    )
-
-    st.caption(
-        "Tip: Crop your photo closely around the digit "
-        "before uploading it. Avoid including large "
-        "areas of the page."
-    )
-
-    # ==================================================
-    # 6. IMAGE CROPPING CONTROLS
-    # ==================================================
-
-    st.subheader("Adjust Image Crop")
-
-    st.write(
-        "Use these controls to select the area containing "
-        "your digit. The default values suit a digit near "
-        "the center of a portrait photograph."
-    )
-
-    crop_top = st.slider(
-        "Top (%)",
-        0, 90, 15
-    )
-
-    crop_bottom = st.slider(
-        "Bottom (%)",
-        10, 100, 70
-    )
-
-    crop_left = st.slider(
-        "Left (%)",
-        0, 90, 10
-    )
-
-    crop_right = st.slider(
-        "Right (%)",
-        10, 100, 90
-    )
-
-    if crop_top >= crop_bottom or crop_left >= crop_right:
-        st.warning("Please select a valid crop area.")
-        st.stop()
-
-    if st.button("Recognize Digit"):
-
-        # ==================================================
-        # 7. CROP IMAGE
-        # ==================================================
-
-        rgb = np.array(original_image)
-
-        height, width = rgb.shape[:2]
-
-        x1 = int(width * crop_left / 100)
-        x2 = int(width * crop_right / 100)
-
-        y1 = int(height * crop_top / 100)
-        y2 = int(height * crop_bottom / 100)
-
-        cropped_rgb = rgb[y1:y2, x1:x2]
-
-        if cropped_rgb.size == 0:
-            st.error("Invalid crop area.")
-            st.stop()
-
-        # ==================================================
-        # 8. CONVERT TO GRAYSCALE
-        # ==================================================
-
-        gray = cv2.cvtColor(
-            cropped_rgb,
-            cv2.COLOR_RGB2GRAY
-        )
-
-        # ==================================================
-        # 9. AUTO BRIGHTNESS / GAMMA CORRECTION
-        # ==================================================
-
-        mean_brightness = float(np.mean(gray))
-
-        if mean_brightness < 80:
-            gamma = 0.5  # brighten dark images
-        elif mean_brightness > 180:
-            gamma = 1.5  # darken washed-out images
-        else:
-            gamma = 1.0  # no correction needed
-
-        if gamma != 1.0:
-            gamma_corrected = (
-                np.power(gray / 255.0, gamma) * 255.0
-            ).astype(np.uint8)
-        else:
-            gamma_corrected = gray.copy()
-
-        # ==================================================
-        # 10. IMPROVE LOCAL CONTRAST (CLAHE)
-        # ==================================================
-
-        clahe = cv2.createCLAHE(
-            clipLimit=3.0,
-            tileGridSize=(8, 8)
-        )
-
-        enhanced = clahe.apply(gamma_corrected)
-
-        # ==================================================
-        # 11. THRESHOLD THE IMAGE (ADAPTIVE + OTSU FALLBACK)
-        # ==================================================
-
-        # Dark handwriting becomes white foreground.
-        # Light background becomes black.
-
-        binary_adaptive = cv2.adaptiveThreshold(
-            enhanced,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV,
-            31,
-            10
-        )
-
-        total_pixels = binary_adaptive.shape[0] * binary_adaptive.shape[1]
-        nonzero_adaptive = int(np.count_nonzero(binary_adaptive))
-
-        if nonzero_adaptive < int(total_pixels * 0.01):
-            # Foreground too sparse — fall back to Otsu
-            _, binary_otsu = cv2.threshold(
-                enhanced,
-                0,
-                255,
-                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-            )
-            # Pick whichever gives more foreground pixels
-            if int(np.count_nonzero(binary_otsu)) > nonzero_adaptive:
-                binary = binary_otsu
-            else:
-                binary = binary_adaptive
-        else:
-            binary = binary_adaptive
-
-        # ==================================================
-        # 12. MORPHOLOGICAL CLOSING (FILL STROKE GAPS)
-        # ==================================================
-
-        binary = cv2.morphologyEx(
-            binary,
-            cv2.MORPH_CLOSE,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        )
-
-        # ==================================================
-        # 13. REMOVE LONG HORIZONTAL NOTEBOOK LINES
-        # ==================================================
-
-        count_cc, labels_cc, stats_cc, _ = cv2.connectedComponentsWithStats(
-            binary, connectivity=8
-        )
-
-        line_mask_cc = np.zeros_like(binary)
-
-        for i in range(1, count_cc):
-            comp_w = stats_cc[i, cv2.CC_STAT_WIDTH]
-            comp_h = stats_cc[i, cv2.CC_STAT_HEIGHT]
-            # Only erase wide, thin components (notebook ruled lines)
-            if comp_h > 0 and comp_w > 5 * comp_h:
-                line_mask_cc[labels_cc == i] = 255
-
-        # Expand the detected lines slightly then subtract
-        line_mask_dilated = cv2.dilate(
-            line_mask_cc,
-            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        )
-
-        cleaned = cv2.subtract(binary, line_mask_dilated)
-
-        # ==================================================
-        # 14. REMOVE SMALL NOISE COMPONENTS
-        # ==================================================
-
-        count, labels, stats, _ = (
-            cv2.connectedComponentsWithStats(
-                cleaned,
-                connectivity=8
-            )
-        )
-
-        mask = np.zeros_like(cleaned)
-
-        for i in range(1, count):
-
-            area = stats[i, cv2.CC_STAT_AREA]
-
-            # Keep components large enough to be useful.
-            # A low threshold helps preserve thin strokes.
-            if area >= 5:
-                mask[labels == i] = 255
-
-        # ==================================================
-        # 15. LIGHT STROKE NORMALIZATION (SMOOTH JAGGED EDGES)
-        # ==================================================
-
-        mask = cv2.morphologyEx(
-            mask,
-            cv2.MORPH_OPEN,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-        )
-
-        # ==================================================
-        # 16. FIND THE DIGIT
-        # ==================================================
-
-        points = cv2.findNonZero(mask)
-
-        if points is None:
-            st.error(
-                "No digit detected. Adjust the crop "
-                "or upload a clearer image."
-            )
-            st.stop()
-
-        x, y, w, h = cv2.boundingRect(points)
-
-        digit = mask[y:y + h, x:x + w]
-
-        # ==================================================
-        # 17. DESKEW
-        # ==================================================
-
-        digit = deskew(digit)
-
-        # ==================================================
-        # 18. ADD PADDING AROUND THE DIGIT
-        # ==================================================
-
-        padding = max(
-            2,
-            int(max(w, h) * 0.10)
-        )
-
-        padded = cv2.copyMakeBorder(
-            digit,
-            padding,
-            padding,
-            padding,
-            padding,
-            cv2.BORDER_CONSTANT,
-            value=0
-        )
-
-        # ==================================================
-        # 19. RESIZE TO FIT A 20 x 20 AREA
-        # ==================================================
-
-        digit_h, digit_w = padded.shape
-
-        scale = 20.0 / max(
-            digit_h,
-            digit_w
-        )
-
-        new_w = max(
-            1,
-            int(round(digit_w * scale))
-        )
-
-        new_h = max(
-            1,
-            int(round(digit_h * scale))
-        )
-
-        resized = cv2.resize(
-            padded,
-            (new_w, new_h),
-            interpolation=cv2.INTER_AREA
-        )
-
-        # ==================================================
-        # 20. CENTER IN A 28 x 28 CANVAS
-        # ==================================================
-
-        canvas = np.zeros(
-            (28, 28),
-            dtype=np.uint8
-        )
-
-        offset_x = (28 - new_w) // 2
-        offset_y = (28 - new_h) // 2
-
-        canvas[
-            offset_y:offset_y + new_h,
-            offset_x:offset_x + new_w
-        ] = resized
-
-        # ==================================================
-        # 21. QUALITY FEEDBACK
-        # ==================================================
-
-        nonzero_canvas = int(np.count_nonzero(canvas))
-
-        if nonzero_canvas < 20:
-            st.warning(
-                "The processed image looks very sparse (fewer than 20 "
-                "white pixels). The crop may be off, or the digit is "
-                "very faint. Consider adjusting the crop sliders."
-            )
-        elif nonzero_canvas > 700:
-            st.warning(
-                "The processed image is very dense (more than 700 "
-                "white pixels). There may be significant background "
-                "noise. Consider adjusting the crop sliders."
-            )
-
-        # ==================================================
-        # 22. PREPARE CNN INPUT
-        # ==================================================
-
-        img_array = canvas.astype(
-            np.float32
-        ) / 255.0
-
-        img_array = img_array.reshape(
-            1, 28, 28, 1
-        )
-
-        # ==================================================
-        # 23. MAKE PREDICTION
-        # ==================================================
-
-        try:
-            predictions = model.predict(
-                img_array,
-                verbose=0
-            )[0]
-
-        except Exception as e:
-            st.error(f"Prediction failed: {e}")
-            st.stop()
-
-        predicted_digit = int(
-            np.argmax(predictions)
-        )
-
-        model_score = float(
-            predictions[predicted_digit]
-        ) * 100
-
-        # ==================================================
-        # 24. DISPLAY PROCESSED IMAGE
-        # ==================================================
-
-        st.subheader("Processed Image")
-
-        st.write(
-            "This is the 28 x 28 image passed to the CNN."
-        )
+    if original_image is not None:
 
         st.image(
-            canvas,
-            caption="CNN Input",
-            width=280
+            original_image,
+            caption="Original Uploaded Image",
+            width=350
         )
 
-        # ==================================================
-        # 25. DISPLAY PREDICTION
-        # ==================================================
+        # ----------------------------------------------
+        # 6. CROP CONTROLS
+        # ----------------------------------------------
 
-        st.subheader("Prediction Result")
-
-        st.success(
-            f"Predicted Digit: {predicted_digit}"
+        st.subheader("Adjust Image Crop")
+        st.write(
+            "Select the area containing your digit. "
+            "Keep it as tight as possible."
         )
 
-        st.metric(
-            "Model Score",
-            f"{model_score:.2f}%"
+        crop_top = st.slider("Top (%)", 0, 90, 15)
+        crop_bottom = st.slider("Bottom (%)", 10, 100, 70)
+        crop_left = st.slider("Left (%)", 0, 90, 10)
+        crop_right = st.slider("Right (%)", 10, 100, 90)
+
+        crop_valid = (
+            crop_top < crop_bottom and crop_left < crop_right
         )
 
-        # ==================================================
-        # 26. DISPLAY ALL MODEL SCORES
-        # ==================================================
+        if not crop_valid:
+            st.warning("Please select a valid crop area.")
 
-        st.subheader("Scores for Digits 0–9")
+        if crop_valid and st.button("Recognize Digit"):
 
-        score_data = {
-            str(i): float(predictions[i])
-            for i in range(10)
-        }
+            rgb = np.array(original_image)
+            height, width = rgb.shape[:2]
 
-        st.bar_chart(score_data)
+            x1 = int(width * crop_left / 100)
+            x2 = int(width * crop_right / 100)
+            y1 = int(height * crop_top / 100)
+            y2 = int(height * crop_bottom / 100)
 
-        # ==================================================
-        # 27. SHOW IMAGE PROCESSING STEPS (DEBUG)
-        # ==================================================
+            cropped_rgb = rgb[y1:y2, x1:x2]
 
-        with st.expander("Debug Image Processing"):
+            if cropped_rgb.size == 0:
+                st.error("Invalid crop area.")
+            else:
+                binary, debug = photo_to_binary(cropped_rgb)
+                canvas28 = to_28x28(binary, thicken=True)
 
-            st.image(
-                cropped_rgb,
-                caption="1. Cropped Original Image"
-            )
+                if canvas28 is None:
+                    st.error(
+                        "No digit detected. Adjust the crop "
+                        "or upload a clearer image."
+                    )
+                else:
+                    nz = int(np.count_nonzero(canvas28))
 
-            st.image(
-                gamma_corrected,
-                caption="2. Gamma Corrected"
-            )
+                    if nz < 20:
+                        st.warning(
+                            "The processed image is very sparse. "
+                            "The crop may be off, or the digit is faint."
+                        )
+                    elif nz > 700:
+                        st.warning(
+                            "The processed image is very dense. "
+                            "There may be background noise."
+                        )
 
-            st.image(
-                enhanced,
-                caption="3. Enhanced Grayscale (CLAHE)"
-            )
+                    predictions = predict_digit(canvas28)
 
-            st.image(
-                binary,
-                caption="4. Thresholded (after closing)"
-            )
+                    st.subheader("Processed Image")
+                    st.write("This is the 28 x 28 image passed to the CNN.")
+                    st.image(canvas28, caption="CNN Input", width=280)
 
-            st.image(
-                cleaned,
-                caption="5. After Line Removal"
-            )
+                    show_prediction(predictions)
 
-            st.image(
-                mask,
-                caption="6. After Noise Removal"
-            )
+                    with st.expander("Debug Image Processing"):
+                        st.image(cropped_rgb, caption="0. Cropped Original")
+                        for caption, img in debug.items():
+                            st.image(img, caption=caption)
+                        st.image(canvas28, caption="5. Final 28×28 input")
 
-            st.image(
-                digit,
-                caption="7. Deskewed Digit (before 28×28 resize)"
-            )
+                    st.caption(
+                        "The model score is not necessarily a calibrated "
+                        "probability. Incorrect predictions are possible."
+                    )
 
-        st.caption(
-            "The model score is not necessarily a calibrated "
-            "probability. Incorrect predictions are possible."
-        )
 
 # ==================================================
-# 28. DRAW DIGIT ON SCREEN
+# 7. DRAW DIGIT ON SCREEN
 # ==================================================
 
 st.divider()
-
 st.header("✍️ Draw a Digit")
 
 st.write(
@@ -549,16 +378,13 @@ st.write(
     "in the white box below."
 )
 
-# Create a key for resetting the canvas
 if "canvas_reset_counter" not in st.session_state:
     st.session_state.canvas_reset_counter = 0
 
-# Clear button
 if st.button("🧹 Clear Drawing"):
     st.session_state.canvas_reset_counter += 1
     st.rerun()
 
-# Drawing canvas
 canvas_result = st_canvas(
     stroke_width=15,
     stroke_color="#000000",
@@ -571,150 +397,24 @@ canvas_result = st_canvas(
     return_image_data=True
 )
 
-# Predict button
 if st.button("🔍 Predict Drawn Digit"):
 
     if canvas_result.image_data is None:
         st.warning("Please draw a digit first.")
-
     else:
+        rgba = np.asarray(canvas_result.image_data).astype(np.uint8)
+        gray = cv2.cvtColor(rgba, cv2.COLOR_RGBA2GRAY)
 
-        # Convert canvas image to an 8-bit array
-        rgba = np.asarray(
-            canvas_result.image_data
-        ).astype(np.uint8)
+        _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
 
-        # Convert RGBA to grayscale
-        gray = cv2.cvtColor(
-            rgba,
-            cv2.COLOR_RGBA2GRAY
-        )
+        processed = to_28x28(binary, thicken=False)
 
-        # Convert the black digit to white foreground
-        # and the white background to black
-        _, binary = cv2.threshold(
-            gray,
-            200,
-            255,
-            cv2.THRESH_BINARY_INV
-        )
-
-        # Find the digit boundaries
-        points = cv2.findNonZero(binary)
-
-        if points is None:
+        if processed is None:
             st.warning("Please draw a digit first.")
-
         else:
+            predictions = predict_digit(processed)
 
-            x, y, w, h = cv2.boundingRect(points)
-
-            digit = binary[y:y + h, x:x + w]
-
-            # Add padding around the digit
-            padding = max(
-                2,
-                int(max(w, h) * 0.10)
-            )
-
-            digit = cv2.copyMakeBorder(
-                digit,
-                padding,
-                padding,
-                padding,
-                padding,
-                cv2.BORDER_CONSTANT,
-                value=0
-            )
-
-            # Resize while preserving the aspect ratio
-            digit_h, digit_w = digit.shape
-
-            scale = 20.0 / max(
-                digit_h,
-                digit_w
-            )
-
-            new_w = max(
-                1,
-                int(round(digit_w * scale))
-            )
-
-            new_h = max(
-                1,
-                int(round(digit_h * scale))
-            )
-
-            resized = cv2.resize(
-                digit,
-                (new_w, new_h),
-                interpolation=cv2.INTER_AREA
-            )
-
-            # Center the digit in a 28 x 28 image
-            processed = np.zeros(
-                (28, 28),
-                dtype=np.uint8
-            )
-
-            offset_x = (28 - new_w) // 2
-            offset_y = (28 - new_h) // 2
-
-            processed[
-                offset_y:offset_y + new_h,
-                offset_x:offset_x + new_w
-            ] = resized
-
-            # Normalize and prepare CNN input
-            img_array = processed.astype(
-                np.float32
-            ) / 255.0
-
-            img_array = img_array.reshape(
-                1, 28, 28, 1
-            )
-
-            # Predict the digit
-            predictions = model.predict(
-                img_array,
-                verbose=0
-            )[0]
-
-            predicted_digit = int(
-                np.argmax(predictions)
-            )
-
-            model_score = float(
-                predictions[predicted_digit]
-            ) * 100
-
-            # Display processed image
             st.subheader("Processed Drawing")
+            st.image(processed, caption="28 x 28 CNN Input", width=200)
 
-            st.image(
-                processed,
-                caption="28 x 28 CNN Input",
-                width=200
-            )
-
-            # Display result
-            st.subheader("Prediction Result")
-
-            st.success(
-                f"Predicted Digit: {predicted_digit}"
-            )
-
-            st.metric(
-                "Model Score",
-                f"{model_score:.2f}%"
-            )
-
-            # Display scores for all digits
-            st.subheader("Scores for Digits 0–9")
-
-            score_data = {
-                str(i): float(predictions[i])
-                for i in range(10)
-            }
-
-            st.bar_chart(score_data)
+            show_prediction(predictions)
