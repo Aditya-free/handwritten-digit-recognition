@@ -3,8 +3,23 @@ import tensorflow as tf
 import numpy as np
 import cv2
 
-from PIL import Image, ImageOps
-from streamlit_drawable_canvas import st_canvas
+from PIL import Image
+
+# Register any component manifests for Streamlit 1.66+ components
+try:
+    from streamlit.components.v2 import get_bidi_component_manager
+    from streamlit.components.v2.manifest_scanner import scan_component_manifests
+    _mgr = get_bidi_component_manager()
+    for _m, _pkg_root in scan_component_manifests():
+        _mgr.register_from_manifest(_m, _pkg_root)
+except Exception:
+    pass
+
+try:
+    from streamlit_drawable_canvas import st_canvas
+    CANVAS_AVAILABLE = True
+except Exception:
+    CANVAS_AVAILABLE = False
 
 
 # ==================================================
@@ -35,209 +50,202 @@ except Exception as e:
 
 
 # ==================================================
-# 3. IMAGE PROCESSING HELPERS
+# 3. ADVANCED IMAGE PREPROCESSING PIPELINE
 # ==================================================
 
-WORK_SIZE = 400  # photo crop is resized so its longest side is this many px
-
-
-def photo_to_binary(rgb):
+def center_by_center_of_mass(canvas_28x28):
     """
-    Notebook photo (RGB crop) -> binary image (white ink, black background).
-    Returns (binary, debug_images).
+    Shifts the 28x28 digit canvas so its center of mass is at (14, 14),
+    matching the official MNIST dataset standard.
     """
-    debug = {}
-
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-
-    # --- 1. Resize to a fixed working size so kernel sizes are predictable
-    h, w = gray.shape
-    scale = WORK_SIZE / max(h, w)
-    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
-    gray = cv2.resize(
-        gray,
-        (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
-        interpolation=interp
-    )
-
-    # --- 2. Remove uneven lighting / paper shading
-    #        (estimate the background, then divide it out)
-    bg = cv2.dilate(
-        gray,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    )
-    bg = cv2.medianBlur(bg, 31)
-    bg = np.maximum(bg, 1)
-    norm = cv2.divide(gray, bg, scale=255)
-    norm = cv2.GaussianBlur(norm, (3, 3), 0)
-    debug["1. Background-normalised gray"] = norm
-
-    # --- 3. Otsu threshold: dark ink -> white
-    _, binary = cv2.threshold(
-        norm, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-    )
-    debug["2. Thresholded"] = binary.copy()
-
-    # --- 4. Remove thin horizontal notebook lines (even if they touch the digit)
-    line_len = max(15, binary.shape[1] // 3)
-    lines = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (line_len, 1))
-    )
-    # keep thick parts (e.g. the bar of a 7 or 5), remove only thin parts
-    thick = cv2.morphologyEx(
-        lines,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7))
-    )
-    thin_lines = cv2.subtract(lines, thick)
-    thin_lines = cv2.dilate(
-        thin_lines,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3))
-    )
-    binary = cv2.subtract(binary, thin_lines)
-
-    # --- 5. Close small gaps left in the strokes
-    binary = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    )
-    debug["3. After line removal + closing"] = binary.copy()
-
-    # --- 6. Keep only the main digit (drop stray noise)
-    binary = keep_main_digit(binary)
-    debug["4. Main digit only"] = binary.copy()
-
-    return binary, debug
-
-
-def keep_main_digit(binary):
-    """Keep the largest component plus big pieces close to it."""
-    n, labels, stats, cents = cv2.connectedComponentsWithStats(
-        binary, connectivity=8
-    )
-
-    if n <= 1:
-        return binary
-
-    areas = stats[1:, cv2.CC_STAT_AREA]
-    largest = 1 + int(np.argmax(areas))
-    lx, ly, lw, lh = stats[largest, :4]
-    max_area = areas.max()
-
-    keep = np.zeros_like(binary)
-
-    for i in range(1, n):
-        if i == largest:
-            keep[labels == i] = 255
-            continue
-
-        area = stats[i, cv2.CC_STAT_AREA]
-        cx, cy = cents[i]
-
-        near = (
-            lx - 0.5 * lw <= cx <= lx + 1.5 * lw
-            and ly - 0.5 * lh <= cy <= ly + 1.5 * lh
+    M = cv2.moments(canvas_28x28)
+    if M["m00"] > 0:
+        cx = M["m10"] / M["m00"]
+        cy = M["m01"] / M["m00"]
+        shift_x = int(round(14.0 - cx))
+        shift_y = int(round(14.0 - cy))
+        shift_x = max(-4, min(4, shift_x))
+        shift_y = max(-4, min(4, shift_y))
+        M_shift = np.float32([[1, 0, shift_x], [0, 1, shift_y]])
+        return cv2.warpAffine(
+            canvas_28x28,
+            M_shift,
+            (28, 28),
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
         )
-
-        # broken strokes (like in 4, 5, 7) are kept; tiny specks are dropped
-        if near and area >= 0.10 * max_area:
-            keep[labels == i] = 255
-
-    return keep
+    return canvas_28x28
 
 
-def thicken_strokes(digit, size, target_ratio=0.08):
+def process_digit_patch(digit_mask):
     """
-    Pen strokes are thin compared to MNIST / canvas strokes.
-    Estimate the stroke width and dilate until it is ~8% of digit size.
+    Takes an isolated binary mask (white digit on black background),
+    normalizes stroke thickness to match MNIST, scales to 20x20,
+    and centers it into a 28x28 canvas using Center of Mass.
     """
-    dist = cv2.distanceTransform(digit, cv2.DIST_L2, 3)
-    vals = dist[digit > 0]
-
-    if vals.size == 0:
-        return digit
-
-    stroke = 4.0 * float(np.mean(vals))  # approx. stroke width in px
-    target = target_ratio * size
-
-    if stroke >= target:
-        return digit
-
-    add = int(round((target - stroke) / 2))
-    add = min(add, max(1, int(size * 0.06)))
-
-    if add < 1:
-        return digit
-
-    return cv2.dilate(
-        digit,
-        cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (2 * add + 1, 2 * add + 1)
-        )
-    )
-
-
-def to_28x28(binary, thicken=False):
-    """
-    White-on-black binary image -> 28x28 MNIST-style image.
-    Used by BOTH the photo path and the canvas path.
-    """
-    points = cv2.findNonZero(binary)
-
-    if points is None:
+    pts = cv2.findNonZero(digit_mask)
+    if pts is None:
         return None
 
-    x, y, w, h = cv2.boundingRect(points)
-    digit = binary[y:y + h, x:x + w]
+    dx, dy, dw, dh = cv2.boundingRect(pts)
+    digit_crop = digit_mask[dy:dy + dh, dx:dx + dw]
 
-    size = max(w, h)
-    padding = max(2, int(size * 0.10))
+    # Normalize stroke thickness for camera photos
+    # MNIST strokes in 28x28 are ~2.5-3.5 px (~12-15% of digit height)
+    target_stroke = max(1, int(round(dh * 0.08)))
+    if target_stroke > 3:
+        dilate_size = max(3, target_stroke // 2) | 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_size, dilate_size))
+        digit_crop = cv2.dilate(digit_crop, kernel)
 
-    digit = cv2.copyMakeBorder(
-        digit, padding, padding, padding, padding,
+    # Pad around the digit
+    pad = max(4, int(max(dw, dh) * 0.15))
+    padded = cv2.copyMakeBorder(
+        digit_crop, pad, pad, pad, pad,
         cv2.BORDER_CONSTANT, value=0
     )
 
-    if thicken:
-        digit = thicken_strokes(digit, size)
+    # Scale to fit inside 20x20 preserving aspect ratio
+    scale = 20.0 / max(padded.shape)
+    new_w = max(1, int(round(padded.shape[1] * scale)))
+    new_h = max(1, int(round(padded.shape[0] * scale)))
+    resized = cv2.resize(padded, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    digit_h, digit_w = digit.shape
-    scale = 20.0 / max(digit_h, digit_w)
+    # Center in 28x28 canvas
+    canvas = np.zeros((28, 28), dtype=np.uint8)
+    ox = (28 - new_w) // 2
+    oy = (28 - new_h) // 2
+    canvas[oy:oy + new_h, ox:ox + new_w] = resized
 
-    new_w = max(1, int(round(digit_w * scale)))
-    new_h = max(1, int(round(digit_h * scale)))
+    # Center of mass alignment
+    return center_by_center_of_mass(canvas)
 
-    resized = cv2.resize(
-        digit, (new_w, new_h), interpolation=cv2.INTER_AREA
+
+def extract_digit_from_photo(img_rgb):
+    """
+    Robustly segments a handwritten digit from plain paper or lined notebook photos:
+    1. Illumination normalization (removes shadows, paper grain, uneven lighting)
+    2. Dynamic thresholding (preserves faint pen ink)
+    3. Notebook ruled-line removal via HoughLinesP and morphology
+    4. Stroke bridging (heals cuts through digits where ruled lines passed)
+    5. Connected-component candidate filtering & nearby stroke merging
+    6. Center-of-mass aligned 28x28 MNIST canvas generation
+    """
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    h, w = gray.shape
+
+    # 1. Illumination estimation using Gaussian Blur
+    ksize = max(25, int(min(h, w) * 0.08) | 1)
+    bg = cv2.GaussianBlur(gray, (ksize, ksize), 0)
+
+    # Ink difference: ink is darker than paper, so (bg - gray) > 0 for ink
+    if np.mean(gray) > 120:
+        diff = cv2.subtract(bg, gray)
+    else:
+        diff = cv2.subtract(gray, bg)
+
+    # 2. Dynamic thresholding based on Otsu
+    otsu_val, _ = cv2.threshold(diff, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thresh_val = max(15, int(otsu_val * 0.70))
+    _, binary = cv2.threshold(diff, thresh_val, 255, cv2.THRESH_BINARY)
+
+    # 3. Remove horizontal notebook ruled lines using HoughLinesP & Morphology
+    lines = cv2.HoughLinesP(
+        binary, 1, np.pi / 180,
+        threshold=70,
+        minLineLength=int(w * 0.25),
+        maxLineGap=30
+    )
+    line_mask = np.zeros_like(binary)
+    if lines is not None:
+        for l in lines.reshape(-1, 4):
+            x1, y1, x2, y2 = l
+            angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+            # Ruled notebook lines are nearly horizontal (within +/- 12 degrees)
+            if abs(angle) < 12 or abs(angle - 180) < 12 or abs(angle + 180) < 12:
+                cv2.line(line_mask, (x1, y1), (x2, y2), 255, 4)
+
+    # Secondary morphological horizontal line detector
+    horiz_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (int(w * 0.20), 1))
+    morph_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horiz_kernel)
+    line_mask = cv2.bitwise_or(line_mask, morph_lines)
+
+    # Subtract detected lines from binary image
+    binary_no_lines = cv2.subtract(binary, line_mask)
+
+    # 4. Stroke bridging: restore strokes that were cut by notebook lines
+    vert_bridge = cv2.morphologyEx(
+        binary_no_lines,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 11))
+    )
+    stroke_bridge = cv2.morphologyEx(
+        vert_bridge,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     )
 
-    out = np.zeros((28, 28), dtype=np.uint8)
-    off_x = (28 - new_w) // 2
-    off_y = (28 - new_h) // 2
-    out[off_y:off_y + new_h, off_x:off_x + new_w] = resized
+    # 5. Connected components on cleaned image
+    num_comps, labels, stats, _ = cv2.connectedComponentsWithStats(stroke_bridge)
+    if num_comps <= 1:
+        return None, None, None, "No handwritten digit found in the image."
 
-    return out
+    # Filter candidate components: eliminate edge noise, table borders, or ruled line fragments
+    candidates = []
+    for i in range(1, num_comps):
+        cx, cy, cw, ch, ca = stats[i]
+        # Digits are not the full width of the image
+        if cw > w * 0.75:
+            continue
+        # Digits are not located completely on the outer border
+        if cy + ch > h * 0.95 or cy < h * 0.02:
+            if ch < 100:
+                continue
+        if ca >= 40:
+            aspect = cw / max(1, ch)
+            if 0.15 < aspect < 3.0:
+                candidates.append((i, ca, (cx, cy, cw, ch)))
 
+    if not candidates:
+        return None, None, None, "Could not isolate a valid digit candidate."
 
-def predict_digit(img28):
-    arr = img28.astype(np.float32) / 255.0
-    arr = arr.reshape(1, 28, 28, 1)
-    return model.predict(arr, verbose=0)[0]
+    # Pick the primary digit component (largest area among valid candidates)
+    best_candidate = sorted(candidates, key=lambda x: x[1], reverse=True)[0]
+    best_idx = best_candidate[0]
+    mx, my, mw, mh = best_candidate[2]
 
+    digit_mask = (labels == best_idx).astype(np.uint8) * 255
 
-def show_prediction(predictions):
-    predicted_digit = int(np.argmax(predictions))
-    score = float(predictions[predicted_digit]) * 100
+    # Merge nearby components belonging to the same digit (e.g. crossbars of 4, 5, 7)
+    margin = int(max(mw, mh) * 0.35)
+    for other_idx, oa, (ox, oy, ow, oh) in candidates:
+        if other_idx == best_idx:
+            continue
+        if (ox + ow >= mx - margin and ox <= mx + mw + margin and
+            oy + oh >= my - margin and oy <= my + mh + margin):
+            digit_mask[labels == other_idx] = 255
 
-    st.subheader("Prediction Result")
-    st.success(f"Predicted Digit: {predicted_digit}")
-    st.metric("Model Score", f"{score:.2f}%")
+    pts = cv2.findNonZero(digit_mask)
+    if pts is None:
+        return None, None, None, "Could not locate digit boundaries."
 
-    st.subheader("Scores for Digits 0–9")
-    st.bar_chart({str(i): float(predictions[i]) for i in range(10)})
+    bx, by, bw, bh = cv2.boundingRect(pts)
+    bbox = (bx, by, bw, bh)
+
+    # Create 28x28 canvas
+    canvas = process_digit_patch(digit_mask)
+    if canvas is None:
+        return None, None, None, "Failed to build 28x28 representation."
+
+    debug_info = {
+        "diff": diff,
+        "line_mask": line_mask,
+        "stroke_bridge": stroke_bridge,
+        "digit_mask": digit_mask,
+        "bbox": bbox
+    }
+
+    return canvas, bbox, debug_info, None
 
 
 # ==================================================
@@ -248,173 +256,209 @@ st.title("🔢 Handwritten Digit Recognition")
 st.subheader("Deep Learning Project Using CNN")
 
 st.write(
-    "Upload a handwritten digit image from 0 to 9. "
-    "The CNN model will predict the digit."
+    "Upload a photo of a handwritten digit from plain paper or lined notebook, "
+    "or draw one directly on the canvas below."
 )
 
 st.info(
-    "For best results with notebook photos: ensure good lighting, "
-    "hold the camera steady, write with a dark pen, and crop tightly "
-    "around the digit."
+    "💡 **Automatic Detection & Ruled-Line Removal**: The app automatically detects "
+    "the digit, erases notebook lines, heals cut strokes, and removes shadows."
 )
 
 
 # ==================================================
-# 5. UPLOAD IMAGE
+# 5. UPLOAD IMAGE SECTION
 # ==================================================
 
 uploaded_file = st.file_uploader(
-    "Choose a digit image",
+    "Choose a digit image (photo of notebook or paper)",
     type=["png", "jpg", "jpeg"]
 )
 
 if uploaded_file is not None:
-
-    original_image = None
-
     try:
-        original_image = ImageOps.exif_transpose(
-            Image.open(uploaded_file)
-        ).convert("RGB")
+        original_image = Image.open(uploaded_file).convert("RGB")
     except Exception:
-        st.error("Unable to open this image.")
+        st.error("Unable to open this image file.")
+        st.stop()
 
-    if original_image is not None:
+    rgb_full = np.array(original_image)
+    h_full, w_full = rgb_full.shape[:2]
 
-        st.image(
-            original_image,
-            caption="Original Uploaded Image",
-            width=350
-        )
+    st.image(
+        original_image,
+        caption=f"Uploaded Image ({w_full} × {h_full} px)",
+        use_container_width=True
+    )
 
-        # ----------------------------------------------
-        # 6. CROP CONTROLS
-        # ----------------------------------------------
+    # Optional manual crop
+    with st.expander("✂️ Optional: Adjust Crop Area (only needed for multi-digit pages)"):
+        use_manual_crop = st.checkbox("Enable manual cropping", value=False)
+        c_col1, c_col2 = st.columns(2)
+        with c_col1:
+            crop_top = st.slider("Top (%)", 0, 90, 0)
+            crop_left = st.slider("Left (%)", 0, 90, 0)
+        with c_col2:
+            crop_bottom = st.slider("Bottom (%)", 10, 100, 100)
+            crop_right = st.slider("Right (%)", 10, 100, 100)
 
-        st.subheader("Adjust Image Crop")
-        st.write(
-            "Select the area containing your digit. "
-            "Keep it as tight as possible."
-        )
-
-        crop_top = st.slider("Top (%)", 0, 90, 15)
-        crop_bottom = st.slider("Bottom (%)", 10, 100, 70)
-        crop_left = st.slider("Left (%)", 0, 90, 10)
-        crop_right = st.slider("Right (%)", 10, 100, 90)
-
-        crop_valid = (
-            crop_top < crop_bottom and crop_left < crop_right
-        )
-
-        if not crop_valid:
-            st.warning("Please select a valid crop area.")
-
-        if crop_valid and st.button("Recognize Digit"):
-
-            rgb = np.array(original_image)
-            height, width = rgb.shape[:2]
-
-            x1 = int(width * crop_left / 100)
-            x2 = int(width * crop_right / 100)
-            y1 = int(height * crop_top / 100)
-            y2 = int(height * crop_bottom / 100)
-
-            cropped_rgb = rgb[y1:y2, x1:x2]
-
-            if cropped_rgb.size == 0:
-                st.error("Invalid crop area.")
+    if st.button("🔍 Recognize Digit from Photo", type="primary"):
+        with st.spinner("Processing image and predicting..."):
+            # Determine region to process
+            if use_manual_crop and (crop_top < crop_bottom and crop_left < crop_right):
+                y1 = int(h_full * crop_top / 100)
+                y2 = int(h_full * crop_bottom / 100)
+                x1 = int(w_full * crop_left / 100)
+                x2 = int(w_full * crop_right / 100)
+                proc_img = rgb_full[y1:y2, x1:x2]
+                offset_x, offset_y = x1, y1
             else:
-                binary, debug = photo_to_binary(cropped_rgb)
-                canvas28 = to_28x28(binary, thicken=True)
+                proc_img = rgb_full
+                offset_x, offset_y = 0, 0
 
-                if canvas28 is None:
-                    st.error(
-                        "No digit detected. Adjust the crop "
-                        "or upload a clearer image."
+            canvas, bbox, debug_info, err_msg = extract_digit_from_photo(proc_img)
+
+            if err_msg or canvas is None:
+                st.error(f"Detection error: {err_msg}")
+            else:
+                # Prepare CNN input
+                img_array = (canvas.astype(np.float32) / 255.0).reshape(1, 28, 28, 1)
+                predictions = model.predict(img_array, verbose=0)[0]
+                predicted_digit = int(np.argmax(predictions))
+                model_score = float(predictions[predicted_digit]) * 100
+
+                # Display detected bounding box on original image
+                bx, by, bw, bh = bbox
+                annotated = rgb_full.copy()
+                global_bx = bx + offset_x
+                global_by = by + offset_y
+                cv2.rectangle(
+                    annotated,
+                    (global_bx, global_by),
+                    (global_bx + bw, global_by + bh),
+                    (0, 220, 0),
+                    max(2, int(min(h_full, w_full) * 0.005))
+                )
+
+                st.subheader("🎯 Detection & Prediction")
+                res_col1, res_col2 = st.columns([1, 1])
+
+                with res_col1:
+                    st.image(
+                        annotated,
+                        caption="Automatically Detected Digit (Green Box)",
+                        use_container_width=True
                     )
-                else:
-                    nz = int(np.count_nonzero(canvas28))
 
-                    if nz < 20:
-                        st.warning(
-                            "The processed image is very sparse. "
-                            "The crop may be off, or the digit is faint."
-                        )
-                    elif nz > 700:
-                        st.warning(
-                            "The processed image is very dense. "
-                            "There may be background noise."
-                        )
-
-                    predictions = predict_digit(canvas28)
-
-                    st.subheader("Processed Image")
-                    st.write("This is the 28 x 28 image passed to the CNN.")
-                    st.image(canvas28, caption="CNN Input", width=280)
-
-                    show_prediction(predictions)
-
-                    with st.expander("Debug Image Processing"):
-                        st.image(cropped_rgb, caption="0. Cropped Original")
-                        for caption, img in debug.items():
-                            st.image(img, caption=caption)
-                        st.image(canvas28, caption="5. Final 28×28 input")
-
-                    st.caption(
-                        "The model score is not necessarily a calibrated "
-                        "probability. Incorrect predictions are possible."
+                with res_col2:
+                    st.image(
+                        canvas,
+                        caption="Processed 28 × 28 CNN Input",
+                        width=180
                     )
+                    st.success(f"### Predicted Digit: **{predicted_digit}**")
+                    st.metric("Model Confidence", f"{model_score:.2f}%")
+
+                # Probability bar chart
+                st.subheader("📊 Confidence Distribution (Digits 0–9)")
+                score_data = {str(i): float(predictions[i]) for i in range(10)}
+                st.bar_chart(score_data)
+
+                # Debug pipeline
+                with st.expander("🛠️ View Image Preprocessing Steps"):
+                    d_col1, d_col2 = st.columns(2)
+                    with d_col1:
+                        st.image(debug_info["diff"], caption="1. Illumination Normalized (Ink Difference)")
+                        st.image(debug_info["line_mask"], caption="2. Detected Notebook Ruled Lines")
+                    with d_col2:
+                        st.image(debug_info["stroke_bridge"], caption="3. Cleaned & Stroke-Bridged Mask")
+                        st.image(debug_info["digit_mask"], caption="4. Isolated Digit Mask")
+                    st.image(canvas, caption="5. Final 28×28 Centered Input", width=140)
 
 
 # ==================================================
-# 7. DRAW DIGIT ON SCREEN
+# 6. DRAW DIGIT ON SCREEN SECTION
 # ==================================================
 
 st.divider()
 st.header("✍️ Draw a Digit")
-
-st.write(
-    "Use your mouse to draw a digit from 0 to 9 "
-    "in the white box below."
-)
+st.write("Draw any digit from 0 to 9 in the canvas below:")
 
 if "canvas_reset_counter" not in st.session_state:
     st.session_state.canvas_reset_counter = 0
 
-if st.button("🧹 Clear Drawing"):
-    st.session_state.canvas_reset_counter += 1
-    st.rerun()
+if CANVAS_AVAILABLE:
+    col_btn1, col_btn2 = st.columns([1, 4])
+    with col_btn1:
+        if st.button("🧹 Clear Canvas"):
+            st.session_state.canvas_reset_counter += 1
+            st.rerun()
 
-canvas_result = st_canvas(
-    stroke_width=15,
-    stroke_color="#000000",
-    background_color="#FFFFFF",
-    drawing_mode="freedraw",
-    height=280,
-    width=280,
-    update_streamlit=True,
-    key=f"digit_canvas_{st.session_state.canvas_reset_counter}",
-    return_image_data=True
-)
+    canvas_result = st_canvas(
+        stroke_width=16,
+        stroke_color="#000000",
+        background_color="#FFFFFF",
+        drawing_mode="freedraw",
+        height=280,
+        width=280,
+        update_streamlit=True,
+        key=f"digit_canvas_{st.session_state.canvas_reset_counter}",
+        return_image_data=True
+    )
 
-if st.button("🔍 Predict Drawn Digit"):
-
-    if canvas_result.image_data is None:
-        st.warning("Please draw a digit first.")
-    else:
-        rgba = np.asarray(canvas_result.image_data).astype(np.uint8)
-        gray = cv2.cvtColor(rgba, cv2.COLOR_RGBA2GRAY)
-
-        _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
-
-        processed = to_28x28(binary, thicken=False)
-
-        if processed is None:
+    if st.button("🔍 Predict Drawn Digit"):
+        if canvas_result.image_data is None:
             st.warning("Please draw a digit first.")
         else:
-            predictions = predict_digit(processed)
+            rgba = np.asarray(canvas_result.image_data).astype(np.uint8)
+            gray = cv2.cvtColor(rgba, cv2.COLOR_RGBA2GRAY)
+            _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
 
-            st.subheader("Processed Drawing")
-            st.image(processed, caption="28 x 28 CNN Input", width=200)
+            pts = cv2.findNonZero(binary)
+            if pts is None:
+                st.warning("Canvas is blank. Please draw a digit.")
+            else:
+                x, y, w, h = cv2.boundingRect(pts)
+                digit = binary[y:y + h, x:x + w]
 
-            show_prediction(predictions)
+                # Pad
+                padding = max(4, int(max(w, h) * 0.15))
+                padded = cv2.copyMakeBorder(
+                    digit, padding, padding, padding, padding,
+                    cv2.BORDER_CONSTANT, value=0
+                )
+
+                # Resize to fit 20x20
+                scale = 20.0 / max(padded.shape)
+                new_w = max(1, int(round(padded.shape[1] * scale)))
+                new_h = max(1, int(round(padded.shape[0] * scale)))
+                resized = cv2.resize(padded, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+                # Center in 28x28
+                canvas = np.zeros((28, 28), dtype=np.uint8)
+                ox = (28 - new_w) // 2
+                oy = (28 - new_h) // 2
+                canvas[oy:oy + new_h, ox:ox + new_w] = resized
+
+                # Center of mass alignment
+                canvas = center_by_center_of_mass(canvas)
+
+                # Predict
+                img_array = (canvas.astype(np.float32) / 255.0).reshape(1, 28, 28, 1)
+                predictions = model.predict(img_array, verbose=0)[0]
+                predicted_digit = int(np.argmax(predictions))
+                model_score = float(predictions[predicted_digit]) * 100
+
+                st.subheader("🎯 Drawn Digit Result")
+                draw_col1, draw_col2 = st.columns([1, 2])
+                with draw_col1:
+                    st.image(canvas, caption="28 × 28 CNN Input", width=160)
+                with draw_col2:
+                    st.success(f"### Predicted Digit: **{predicted_digit}**")
+                    st.metric("Model Confidence", f"{model_score:.2f}%")
+
+                st.subheader("📊 Confidence Distribution (Digits 0–9)")
+                score_data = {str(i): float(predictions[i]) for i in range(10)}
+                st.bar_chart(score_data)
+else:
+    st.info("Interactive canvas drawing is disabled in this environment. You can upload photo images above!")
